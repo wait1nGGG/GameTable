@@ -45,13 +45,6 @@ function shuffle(arr) {
   return a;
 }
 
-// 造一张"重复牌"的王（用于全王炸开局，id 唯一避免同值互删）
-function mkJoker(value, uid) {
-  return { id: `joker_${value}_${uid}`, suit: null, value,
-    displayRank: value === 16 ? '小' : '大', displaySuit: '',
-    color: value === 17 ? 'red' : 'black', isJoker: true };
-}
-
 // ==================== COMBINATION DETECTION ====================
 function detectCombination(cards) {
   if (!cards || cards.length === 0) return null;
@@ -541,28 +534,44 @@ const AI = {
   leadGain: 1.5,      // 领出：出完后手牌改善量的权重
   leadCost: 1.1,      // 领出：牌点越大越不急着出
   leadChain: 6,       // 领出：顺子/连对/飞机的额外奖励
-  leadBomb: -40,      // 领出：动炸弹/王炸的代价
+  leadSafe: 8,        // 领出：出对手管不了的牌、把牌权攥在手里的奖励
+  leadBomb: -40,      // 领出：动炸弹/王炸的代价（炸得有价值时不计）
   leadBig: -6,        // 领出：手牌还多时动大牌的代价
   leadSingleVsOne: -30, // 领出：对手只剩一张时出单张的代价
   followBase: 34,     // 接牌的基础分（不出的基准分见 passBase）；调高会让 AI 更积极抢牌权
   followGain: 1.4,    // 接牌：出完后手牌改善量的权重
   followCost: 1.0,    // 接牌：牌点越大越不急着接
-  followBomb: -70,    // 接牌：动炸弹/王炸的代价
-  followUrgent: 45,   // 接牌：对手快走完时的抢牌权加成
+  followBomb: -70,    // 接牌：动炸弹/王炸的代价（炸得有价值时不计）
+  followUrgent: 45,   // 接牌：进入收尾警戒后的抢牌权加成
   followBig: -14,     // 接牌：对手还早时动大牌的代价
   followSmall: 3,     // 接牌：顺手带走小牌的奖励
   passBase: 10,       // 不出
   passOppLow: -18,    // 不出：对手牌少时的惩罚
   passSelfLow: -22,   // 不出：自己牌少时的惩罚
+  passEndgame: -16,   // 不出：对手进入收尾警戒时，抢牌权的额外加成
   structBreak: 3,     // 拆炸弹/拆三张的代价系数
+  bigLord: 0.6,       // 地主一打二：大牌更舍得用（乘在 leadBig/followBig 上）
+  bigFarmer: 1.4,     // 农民二打一：大牌留着拦地主，更舍不得用
+  // ---- 能力开关：三档难度靠它拉开真实差距，而不只是调数值 ----
+  useMemory: true,    // 记牌：判断每个牌组是否还可能被管住
+  useWinPath: true,   // 算必胜路线：会被管的牌组 ≤1 时按必胜顺序出
+  cooperate: true,    // 农民配合：判断何时该接管队友的牌权
+  endgame: 5,         // 对手剩这么多张时进入收尾警戒
 };
 
-// 难度档位：主要靠 followBase（抢不抢牌权）拉开差距，温度只是微调。
-// 数值由自对弈对抗实测标定，见 README 的"AI 强度"一节。
+// 难度档位：不只是数值差，能力也不同。
+// 简单档不记牌、不算必胜线、不懂配合；困难档三样全开，且更敢用炸弹抢牌权。
+// 注意：setDifficulty 用 Object.assign 覆盖，三档必须写全同一组键，否则会串档。
 const DIFFICULTY = {
-  easy:   { followBase: 15, temp: 6.5, structBreak: 1.2, followBig: -26, followUrgent: 22, passOppLow: -10 },
-  normal: { followBase: 25, temp: 4.5, structBreak: 2.2, followBig: -16, followUrgent: 38, passOppLow: -15 },
-  hard:   { followBase: 34, temp: 2.5, structBreak: 3.0, followBig: -14, followUrgent: 45, passOppLow: -18 },
+  easy:   { followBase: 18, followCost: 1.2, temp: 6.5, structBreak: 1.2, followBig: -26, followUrgent: 22,
+            passOppLow: -10, followBomb: -90, leadBomb: -60, passEndgame: -6, endgame: 2,
+            useMemory: false, useWinPath: false, cooperate: false },
+  normal: { followBase: 34, followCost: 0.8, temp: 3.5, structBreak: 2.2, followBig: -16, followUrgent: 38,
+            passOppLow: -15, followBomb: -70, leadBomb: -40, passEndgame: -12, endgame: 4,
+            useMemory: true, useWinPath: true, cooperate: false },
+  hard:   { followBase: 50, followCost: 0.6, temp: 2.0, structBreak: 3.0, followBig: -14, followUrgent: 45,
+            passOppLow: -18, followBomb: -30, leadBomb: -20, passEndgame: -20, endgame: 6,
+            useMemory: true, useWinPath: true, cooperate: true },
 };
 const DIFF_NAMES = { easy: '简单', normal: '普通', hard: '困难' };
 let difficulty = 'normal';
@@ -574,15 +583,32 @@ function setDifficulty(level) {
 }
 setDifficulty(difficulty);
 
+// 炸弹值不值这个价：能一把走完、或炸完进入必胜路线，就不算亏（返回 0）；
+// 否则返回 penalty。这样"炸得有代价"，但关键回合不会因为怕扣分而不敢炸。
+function bombCost(combo, hand, ctx, penalty) {
+  const rest = restAfter(hand, combo);
+  if (!rest.length) return 0;
+  if (AI.useWinPath && ctx && ctx.unseen && leadWinPath(splitHand(rest), ctx.unseen, ctx.oppMax)) return 0;
+  return penalty;
+}
+
+// 角色倾向：地主一打二，要靠抢牌权把自己走完；农民二打一，大牌要留到最后拦地主。
+// 乘在"大牌代价"上 —— 地主的代价打折（更敢用），农民的代价放大（更舍不得用）。
+function bigScale(game, idx) {
+  return game.landlord === idx ? AI.bigLord : AI.bigFarmer;
+}
+
 // ---- 领出（我主动出牌） ----
 function leadScore(combo, hand, game, idx, ctx) {
   let s = (evalHand(restAfter(hand, combo)) - evalHand(hand)) * AI.leadGain;  // 出完这手后手牌是否更接近走完
   s -= baseCost(combo) * AI.leadCost;                                        // 同等条件下先出小牌
   s -= structPenalty(combo.cards, hand) * AI.structBreak;                    // 别乱拆对子/三张/炸弹
   if (CHAIN_TYPES.has(combo.type)) s += AI.leadChain;                        // 顺子/连对/飞机尽早甩掉
-  if (combo.type === 'bomb' || combo.type === 'rocket') s += AI.leadBomb;
-  if (combo.mainRank >= BIG_RANK && hand.length > 6) s += AI.leadBig;
+  if (combo.type === 'bomb' || combo.type === 'rocket') s += bombCost(combo, hand, ctx, AI.leadBomb);
+  if (combo.mainRank >= BIG_RANK && hand.length > 6) s += AI.leadBig * bigScale(game, idx);
   if (ctx && ctx.oppMin === 1 && combo.type === 'single') s += AI.leadSingleVsOne;  // 对手只剩一张，别送单张
+  // 出对手管不了的牌 → 牌权能继续握在自己手里
+  if (ctx && ctx.unseen && !unseenBeats(combo, ctx.unseen, ctx.oppMax)) s += AI.leadSafe;
   return s;
 }
 
@@ -593,11 +619,13 @@ function aiLead(hand, idx, game) {
 
   const opps = opponentCounts(game, idx);
   const oppMax = Math.max(...opps), oppMin = Math.min(...opps);
-  const unseen = unseenCounts(game, hand);
+  const unseen = AI.useMemory ? unseenCounts(game, hand) : null;       // 简单档不记牌
 
-  // 1) 必胜路线
-  const path = leadWinPath(splitHand(hand, { killSingles: oppMin === 1 }), unseen, oppMax);
-  if (path && path.length) return path[0];
+  // 1) 必胜路线：会被管的牌组 ≤1 时，先把不会被管的出完，把会被管的留到最后一手
+  if (AI.useWinPath && unseen) {
+    const path = leadWinPath(splitHand(hand, { killSingles: oppMin === 1 }), unseen, oppMax);
+    if (path && path.length) return path[0];
+  }
 
   // 2) 队友只剩一张：喂一张小单张
   if (teammateCount(game, idx) === 1) {
@@ -623,9 +651,9 @@ function followScore(combo, hand, lastPlay, game, idx, ctx) {
   let s = AI.followBase + (evalHand(restAfter(hand, combo)) - evalHand(hand)) * AI.followGain;
   s -= baseCost(combo) * AI.followCost;
   s -= structPenalty(combo.cards, hand) * AI.structBreak;
-  if (combo.type === 'bomb' || combo.type === 'rocket') s += AI.followBomb;   // 炸弹留着压轴
-  if (ctx.oppMin <= 2) s += AI.followUrgent;                                  // 对手快走完了，必须拦
-  else if (combo.mainRank >= BIG_RANK) s += AI.followBig;                     // 对手还早，别浪费大牌
+  if (combo.type === 'bomb' || combo.type === 'rocket') s += bombCost(combo, hand, ctx, AI.followBomb);  // 炸弹留给关键回合
+  if (ctx.oppMin <= AI.endgame) s += AI.followUrgent;                         // 对手进入收尾，必须拦
+  else if (combo.mainRank >= BIG_RANK) s += AI.followBig * bigScale(game, idx);  // 对手还早，别浪费大牌（按角色缩放）
   if (combo.mainRank <= 10) s += AI.followSmall;                              // 顺手把小牌带走
   return s;
 }
@@ -640,34 +668,45 @@ function aiFollow(hand, lastPlay, idx, game) {
 
   const opps = opponentCounts(game, idx);
   const oppMax = Math.max(...opps), oppMin = Math.min(...opps);
-  const unseen = unseenCounts(game, hand);
+  const unseen = AI.useMemory ? unseenCounts(game, hand) : null;
   const ctx = { oppMin, oppMax, unseen };
   const cheapest = [...cands].sort((a, b) => baseCost(a) - baseCost(b));
+  const nonBomb = cheapest.filter(c => c.type !== 'bomb' && c.type !== 'rocket');
 
-  // 队友出的牌：多数情况让过，把牌权留给队友
+  // ---- 上家是队友：不再一律让过 ----
+  // 原则：队友就要走完 → 让他走；地主快走完 → 必须接管；
+  //       其余情况看"这一手能不能直接收掉、或让我方进入必胜路线"，能才接管。
   if (lastBy !== idx && isTeammate(game, idx, lastBy)) {
-    if (game.hands[lastBy].length <= 2) return null;                   // 队友就要走了，别压
-    if (lastPlay.mainRank >= 14) return null;                          // 队友出的够大，稳
-    if (oppMin > 3) return null;                                       // 局面还早，不抢队友的牌权
-    return cheapest[0];                                                // 对手快走完了，接过来
+    if (game.hands[lastBy].length <= 2) return null;                    // 队友就要走了，别压
+    if (oppMin <= 2) return nonBomb.length ? nonBomb[0] : cheapest[0];  // 地主快走完，接管
+    if (!AI.cooperate) return null;                                     // 简单档：不会配合
+    if (lastPlay.mainRank >= 14 && oppMin > AI.endgame) return null;    // 队友出的够大且局面还早，别抢
+    if (oppMin > 4) return null;                                        // 队友牌权更稳，别打断
+    for (const c of nonBomb) {
+      const rest = restAfter(hand, c);
+      if (!rest.length) return c;                                       // 接过来正好走完
+      if (AI.useWinPath && unseen && leadWinPath(splitHand(rest), unseen, oppMax)) return c;  // 接过来进必胜线
+    }
+    return null;
   }
 
+  // ---- 上家是对手 ----
   // 对手快走完了：必须拦，优先不用炸弹
-  if (oppMin <= 2) {
-    const nonBomb = cheapest.filter(c => c.type !== 'bomb' && c.type !== 'rocket');
-    return nonBomb.length ? nonBomb[0] : cheapest[0];
-  }
+  if (oppMin <= 2) return nonBomb.length ? nonBomb[0] : cheapest[0];
 
-  // 这手管不住 + 出完就进入必胜路线
-  for (const c of cheapest) {
-    if (unseenBeats(c, unseen, oppMax)) continue;
-    const rest = restAfter(hand, c);
-    if (rest.length && leadWinPath(splitHand(rest), unseen, oppMax)) return c;
+  // 这手管不住 + 出完就进入必胜路线 → 直接接管
+  if (AI.useWinPath && unseen) {
+    for (const c of cheapest) {
+      if (unseenBeats(c, unseen, oppMax)) continue;
+      const rest = restAfter(hand, c);
+      if (rest.length && leadWinPath(splitHand(rest), unseen, oppMax)) return c;
+    }
   }
 
   const scored = cands.map(c => ({ combo: c, score: followScore(c, hand, lastPlay, game, idx, ctx) }));
   let passScore = AI.passBase;                                         // 不出：让上家继续领出
   if (oppMin <= 4) passScore += AI.passOppLow;
+  if (oppMin <= AI.endgame) passScore += AI.passEndgame;               // 进入收尾警戒，别轻易把牌权交出去
   if (hand.length <= 4) passScore += AI.passSelfLow;
   scored.push({ combo: null, score: passScore });
   return softChoose(scored, game.aiTemp);
@@ -677,6 +716,80 @@ function aiFollow(hand, lastPlay, idx, game) {
 function localAI(hand, leading, lastPlay, idx, game) {
   if (leading) return aiLead(hand, idx, game);
   return aiFollow(hand, lastPlay, idx, game);
+}
+
+// ==================== OP 开局牌型生成 ====================
+// 从一副完整牌里剔除指定牌，返回剩下的牌堆（余牌发给两台电脑）
+function deckWithout(deck, cards) {
+  const ids = new Set(cards.map(c => c.id));
+  return deck.filter(c => !ids.has(c.id));
+}
+
+// 好牌：5 连飞机（5 个连续三张 = 15 张）+ 5 张单牌 = 20 张，全程无王。
+// 整手恰好是一个合法的「飞机带单」，地主拿到就能一把走完。
+function generateGoodHand() {
+  const start = 3 + Math.floor(Math.random() * 8);        // 3..10，保证 start+4 <= 14
+  const planeRanks = [0, 1, 2, 3, 4].map(i => start + i);
+  const inPlane = new Set(planeRanks);
+
+  const byRank = {};
+  for (const c of createDeck()) { if (c.value <= 14) (byRank[c.value] = byRank[c.value] || []).push(c); }
+
+  const hand = [];
+  for (const r of planeRanks) hand.push(...byRank[r].slice(0, 3));   // 每排 3 张
+
+  // 带牌：从飞机之外的点数里各取 1 张（同点只取一张，保证是"带单"）
+  const kickers = [];
+  for (let r = 3; r <= 14; r++) if (!inPlane.has(r)) kickers.push(r);
+  for (const r of shuffle(kickers).slice(0, 5)) hand.push(byRank[r][0]);
+  return hand;                                                       // 20 张
+}
+
+// 烂牌：无王、无 2、**无 A**，单点最多 3 张（不成炸弹）。
+//
+// 牌池取 3~13（连 A 都不给）是这里最关键的一条，实测出来的：
+//   牌池 3~14（给 A）：地主胜率约 9.3%
+//   牌池 3~13（不给 A）：约 2.7%      ← 差三倍多
+//   牌池 3~12（连 K 也不给）：约 2.8%  ← 没有进一步收益
+// 原因很直白：手里留着 A，地主还能靠它赢一手、抢到牌权；一张 A 都没有就全程被动。
+//
+// 坏度用「手数越多越烂 + 牌点越小越烂」：手数 × 10 − 牌点总和 × 0.07，
+// 低点偏置随机采样若干手取最烂的一手。试过一堆更聪明的写法都不如它——
+// 按可成链长度重罚、最小化 AI 自己的 handStrength、随机起步 + 爬山换牌，
+// 实测地主胜率都在同一档（8~9%）甚至更差，所以这里保持简单。
+function generateBadHand() {
+  const byRank = {};
+  for (const c of createDeck()) { if (c.value >= 3 && c.value <= 13) (byRank[c.value] = byRank[c.value] || []).push(c); }
+  const ranks = Object.keys(byRank).map(Number);
+  const weight = ranks.map(r => 15 - r);                              // 低点更容易被抽到（3 最易、K 最难）
+  const wsum = weight.reduce((a, b) => a + b, 0);
+  const pickRank = () => {
+    let x = Math.random() * wsum;
+    for (let i = 0; i < ranks.length; i++) { x -= weight[i]; if (x <= 0) return ranks[i]; }
+    return ranks[0];
+  };
+
+  let best = null, bestScore = -Infinity;
+  for (let iter = 0; iter < 6000; iter++) {
+    const cnt = {};
+    let total = 0;
+    while (total < 20) {
+      const r = pickRank();
+      if ((cnt[r] || 0) >= 3) continue;
+      cnt[r] = (cnt[r] || 0) + 1; total++;
+    }
+    const cards = [];
+    let sum = 0;
+    for (const r of ranks) {
+      const n = cnt[r] || 0;
+      if (!n) continue;
+      cards.push(...byRank[r].slice(0, n));
+      sum += r * n;
+    }
+    const score = splitHand(cards).length * 10 - sum * 0.07;         // 手数优先，其次牌点越小越好
+    if (score > bestScore) { bestScore = score; best = cards; }
+  }
+  return best;                                                        // 20 张
 }
 
 // ==================== GAME CLASS ====================
@@ -798,25 +911,14 @@ class Game {
     this.playedByRank = {};
     for (const r of ALL_RANKS) this.playedByRank[r] = 0;
 
-    // ---- 整手枪型：五炸 / 全王炸（一手20张即为整个地主手牌）----
-    if (mode === 'bomb5' || mode === 'rockets') {
-      if (mode === 'bomb5') {
-        const ranks = [3, 5, 7, 9, 11];
-        this.hands[0] = [];
-        for (const r of ranks) for (const s of SUITS) this.hands[0].push(createCard(s, r));
-      } else {
-        this.hands[0] = [];
-        for (let i = 0; i < 10; i++) {
-          this.hands[0].push(mkJoker(16, i));          // 10 张小王
-          this.hands[0].push(mkJoker(17, 10 + i));      // 10 张大王
-        }
-      }
-      this.hands[0].sort((a, b) => b.value - a.value);
-      this.bottomCards = this.hands[0].slice(0, 3);
-      // 电脑：从一副真牌里取（排除与玩家重复的id）
-      let d = shuffle(createDeck());
-      const pIds = new Set(this.hands[0].map(c => c.id));
-      d = d.filter(c => !pIds.has(c.id));
+    // ---- 一手成型的开局：烂牌 / 好牌（整手 20 张即地主手牌）----
+    // 底牌取手里最小的三张，好牌/烂牌都保持"无王"
+    if (mode === 'bad' || mode === 'good') {
+      const hand = (mode === 'good' ? generateGoodHand() : generateBadHand());
+      this.hands[0] = hand.slice().sort((a, b) => b.value - a.value);
+      this.bottomCards = hand.slice().sort((a, b) => a.value - b.value).slice(0, 3);
+      // 电脑：从剩下的真牌里取
+      const d = shuffle(deckWithout(createDeck(), this.hands[0]));
       this.hands[1] = d.slice(0, 17);
       this.hands[2] = d.slice(17, 34);
 
@@ -827,7 +929,7 @@ class Game {
       this.lastPlayedBy = null;
       this.passCount = 0;
       this.selectedCards = [];
-      const flabel = mode === 'bomb5' ? '五炸' : '全王炸';
+      const flabel = mode === 'good' ? '好牌' : '烂牌';
       updateStatus(this, `OP：固定「${flabel}」！你是地主，请出牌`);
       renderAll(this);
       updateUI(this);
@@ -885,6 +987,7 @@ class Game {
 
   _processBidding() {
     for (let i = 1; i <= 2; i++) {
+      if (this.bidResponses.find(r => r.playerIdx === i)) continue;   // 切走再切回来时不要重复叫牌
       this._schedule(() => {
         const bid = aiShouldBid(this.hands[i]);
         this.bidResponses.push({ playerIdx: i, bid });
@@ -1272,6 +1375,7 @@ function toggleCardSelection(game, card) {
 function hideOverlay() { document.getElementById('overlay').classList.add('hidden'); document.getElementById('overlay-buttons').innerHTML = ''; }
 
 function showPalmBackUI(game) {
+  if (window.gameMode === 'xq') return;          // 象棋模式下不弹斗地主的流程浮层
   const overlay = document.getElementById('overlay');
   const title = document.getElementById('overlay-title');
   const content = document.getElementById('overlay-content');
@@ -1289,6 +1393,7 @@ function showPalmBackUI(game) {
 }
 
 function showRPSUI(game) {
+  if (window.gameMode === 'xq') return;
   const overlay = document.getElementById('overlay');
   const title = document.getElementById('overlay-title');
   const content = document.getElementById('overlay-content');
@@ -1341,6 +1446,10 @@ function revealRPS(game, humanChoice) {
 }
 
 function showWinScreen(humanWins, isLandlordWin, winnerIdx) {
+  updateStatus(game, isLandlordWin ? '地主获胜！' : '农民获胜！');
+  if (window.gameMode === 'xq') return;
+  const undoBtn = document.getElementById('btn-win-undo');
+  if (undoBtn) undoBtn.style.display = 'none';   // 「撤回」只有象棋有，斗地主不显示
   const overlay = document.getElementById('win-overlay');
   const text = document.getElementById('win-text');
   overlay.classList.remove('hidden');
@@ -1394,17 +1503,20 @@ function bindButtons() {
     this.querySelector('span').textContent = game.showAICards ? '隐藏电脑手牌' : '查看电脑手牌';
     renderAll(game);
   });
-  bind('btn-restart', () => { resetGame(); });
-  bind('btn-win-restart', () => { resetGame(); });
+  bind('btn-restart', () => { restartCurrent(); });
+  bind('btn-win-restart', () => { restartCurrent(); });
   for (const level of ['easy', 'normal', 'hard']) {
     bind(`btn-diff-${level}`, () => {
       if (difficulty === level) return;
       setDifficulty(level);
+      if (window.xiangqi) window.xiangqi.setLevel(level);   // 两个玩法共用这一组难度按钮
       syncDifficultyUI();
-      resetGame();          // 换难度直接重开一局，新难度立即生效
+      restartCurrent();     // 换难度直接重开一局，新难度立即生效
     });
   }
   syncDifficultyUI();
+  bind('btn-game-ddz', () => setGameMode('ddz'));
+  bind('btn-game-xq',  () => setGameMode('xq'));
   bind('counter-toggle', function () {
     const panel = document.getElementById('counter-panel');
     const willOpen = panel.classList.contains('counter-closed');
@@ -1429,8 +1541,8 @@ function bindButtons() {
   bind('op-bomb', () => runOP('bomb'));
   bind('op-plane', () => runOP('plane'));
   bind('op-rocket', () => runOP('rocket'));
-  bind('op-bomb5', () => runOP('bomb5'));
-  bind('op-rockets', () => runOP('rockets'));
+  bind('op-bad', () => runOP('bad'));
+  bind('op-good', () => runOP('good'));
 }
 
 function resetGame() {
@@ -1441,6 +1553,53 @@ function resetGame() {
   window.game = game;
   game.startNewGame();
   syncOpButton();
+}
+
+// ==================== 玩法切换（斗地主 / 中国象棋） ====================
+window.gameMode = 'ddz';
+
+// 切到象棋时把斗地主「冻结」（destroy 停掉定时器，局面留在 game 里）；
+// 切回来再解冻并把待办的一步重新排上，这样两个玩法都能保留各自的棋局。
+function setGameMode(mode) {
+  if (window.gameMode === mode) return;
+  window.gameMode = mode;
+  document.getElementById('game-container').classList.toggle('mode-xq', mode === 'xq');
+  document.getElementById('btn-game-ddz').setAttribute('aria-pressed', String(mode === 'ddz'));
+  document.getElementById('btn-game-xq').setAttribute('aria-pressed', String(mode === 'xq'));
+  document.getElementById('btn-toggle-ai').style.display = mode === 'xq' ? 'none' : '';
+  if (mode === 'xq') {
+    hideOverlay();
+    document.getElementById('win-overlay').classList.add('hidden');
+    game.destroy();
+    if (window.xiangqi) window.xiangqi.activate();
+  } else {
+    if (window.xiangqi) window.xiangqi.deactivate();
+    resumeDdz();
+  }
+}
+
+function resumeDdz() {
+  if (!game || game._alive) return;
+  game._alive = true;
+  renderAll(game);
+  updateUI(game);
+  switch (game.phase) {
+    case PHASE.BIDDING: game._processBidding(); break;
+    case PHASE.PALM_BACK: showPalmBackUI(game); break;
+    case PHASE.RPS: showRPSUI(game); break;
+    case PHASE.PLAYING: if (game.currentPlayer !== 0) game._aiTurn(); break;
+    case PHASE.FINISHED: {
+      const isLandlordWin = game.winner === game.landlord;
+      showWinScreen(game.winner === 0 || (!isLandlordWin && game.landlord !== 0), isLandlordWin, game.winner);
+      break;
+    }
+  }
+}
+
+// 难度按钮 / 重新开始：作用于当前正在玩的玩法
+function restartCurrent() {
+  if (window.gameMode === 'xq' && window.xiangqi) window.xiangqi.restart();
+  else resetGame();
 }
 
 // ==================== DRAG SELECTION ====================

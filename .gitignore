@@ -1,3 +1,6 @@
 node_modules
 .env
 .DS_Store
+
+# 旧版 AI 快照，可用 `git show d42da8e:doudizhu.js > tools/baseline.js` 随时还原
+tools/baseline.js
